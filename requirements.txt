@@ -1,7 +1,7 @@
-fastapi==0.104.1
-uvicorn[standard]==0.24.0.post1
+fastapi==0.115.12
+uvicorn[standard]==0.34.0
 motor==3.6.0
-pydantic==2.4.2
-pydantic-settings==2.0.3
-python-dotenv==1.0.0
-email-validator
+pydantic==2.11.3
+pydantic-settings==2.9.1
+python-dotenv==1.1.0
+email-validator==2.2.0
