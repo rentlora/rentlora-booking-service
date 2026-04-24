@@ -1,0 +1,228 @@
+﻿name: Notify Slack and Gmail
+description: "Universal pipeline notification action for Slack and Gmail"
+
+inputs:
+  # --- Core ------------------------------------------------------------------
+  status:
+    required: true
+    description: "'success' | 'failed'"
+  pipeline:
+    required: true
+    description: "Pipeline name shown in the notification"
+  job_name:
+    required: true
+  service_name:
+    required: false
+    default: ""
+  error_message:
+    required: false
+    default: "Check the GitHub Actions run for details."
+
+  # --- SonarQube -------------------------------------------------------------
+  sonar_bugs:
+    required: false
+    default: "N/A"
+  sonar_vulnerabilities:
+    required: false
+    default: "N/A"
+  sonar_code_smells:
+    required: false
+    default: "N/A"
+  sonar_coverage:
+    required: false
+    default: "N/A"
+  sonar_gate_status:
+    required: false
+    default: "FAILED"
+  sonar_project_key:
+    required: false
+    default: ""
+  sonar_host_url:
+    required: false
+    default: "https://sonarcloud.io"
+
+  # --- Snyk ------------------------------------------------------------------
+  snyk_critical:
+    required: false
+    default: "N/A"
+  snyk_high:
+    required: false
+    default: "N/A"
+  snyk_medium:
+    required: false
+    default: "N/A"
+
+  # --- Trivy -----------------------------------------------------------------
+  trivy_critical:
+    required: false
+    default: "N/A"
+  trivy_high:
+    required: false
+    default: "N/A"
+
+  # --- Docker ----------------------------------------------------------------
+  docker_image:
+    required: false
+    default: "N/A"
+  docker_tag:
+    required: false
+    default: "latest"
+
+  # --- Notification Targets --------------------------------------------------
+  slack_webhook_url:
+    required: true
+  gmail_username:
+    required: false
+    default: ""
+  gmail_app_password:
+    required: false
+    default: ""
+  notify_email_to:
+    required: false
+    default: ""
+
+runs:
+  using: "composite"
+  steps:
+    - name: Resolve notification context
+      id: ctx
+      shell: bash
+      run: |
+        STATUS="${{ inputs.status }}"
+        JOB="${{ inputs.job_name }}"
+        SERVICE="${{ inputs.service_name }}"
+        SERVICE_LABEL="${SERVICE:+[$SERVICE] }"
+
+        if [ "$STATUS" = "success" ]; then
+          echo "status_emoji=SUCCESS"   >> $GITHUB_OUTPUT
+          echo "status_label=SUCCEEDED" >> $GITHUB_OUTPUT
+          echo "color=#2EB67D"          >> $GITHUB_OUTPUT
+        else
+          echo "status_emoji=FAILED"    >> $GITHUB_OUTPUT
+          echo "status_label=FAILED"    >> $GITHUB_OUTPUT
+          echo "color=#E01E5A"          >> $GITHUB_OUTPUT
+        fi
+
+        case "$JOB" in
+          sonarqube)  echo "job_label=${SERVICE_LABEL}SonarQube Scan"    >> $GITHUB_OUTPUT ;;
+          snyk-sca)   echo "job_label=${SERVICE_LABEL}Snyk SCA Scan"     >> $GITHUB_OUTPUT ;;
+          docker)     echo "job_label=${SERVICE_LABEL}Docker Build+Push" >> $GITHUB_OUTPUT ;;
+          trivy-scan) echo "job_label=${SERVICE_LABEL}Trivy Image Scan"  >> $GITHUB_OUTPUT ;;
+          gitops)     echo "job_label=${SERVICE_LABEL}GitOps Deploy"     >> $GITHUB_OUTPUT ;;
+          all)        echo "job_label=${SERVICE_LABEL}All Jobs"          >> $GITHUB_OUTPUT ;;
+          *)          echo "job_label=${SERVICE_LABEL}$JOB"              >> $GITHUB_OUTPUT ;;
+        esac
+
+        DETAIL=""
+        EMAIL_DETAIL=""
+
+        if [ "$STATUS" = "success" ]; then
+          case "$JOB" in
+            all|gitops)
+              DETAIL="SonarQube - Quality Gate PASSED\n Bugs: ${{ inputs.sonar_bugs }} | Vulnerabilities: ${{ inputs.sonar_vulnerabilities }} | Smells: ${{ inputs.sonar_code_smells }} | Coverage: ${{ inputs.sonar_coverage }}%\n\n Snyk - No Critical Vulnerabilities\n Critical: ${{ inputs.snyk_critical }} | High: ${{ inputs.snyk_high }} | Medium: ${{ inputs.snyk_medium }}\n\n Docker - Image Published to GHCR\n docker pull ${{ inputs.docker_image }}:${{ inputs.docker_tag }}\n\n Trivy - No Critical CVEs in image\n Critical: ${{ inputs.trivy_critical }} | High: ${{ inputs.trivy_high }}\n\n GitOps - Helm values updated. ArgoCD syncing now."
+              EMAIL_DETAIL="SonarQube: Quality Gate PASSED\n Bugs: ${{ inputs.sonar_bugs }} | Vulnerabilities: ${{ inputs.sonar_vulnerabilities }} | Smells: ${{ inputs.sonar_code_smells }} | Coverage: ${{ inputs.sonar_coverage }}%\n\nSnyk: No Critical Vulnerabilities\n Critical: ${{ inputs.snyk_critical }} | High: ${{ inputs.snyk_high }} | Medium: ${{ inputs.snyk_medium }}\n\nDocker: Image Published\n docker pull ${{ inputs.docker_image }}:${{ inputs.docker_tag }}\n\nTrivy: No Critical CVEs\n Critical: ${{ inputs.trivy_critical }} | High: ${{ inputs.trivy_high }}\n\nGitOps: Helm values updated - ArgoCD will sync shortly."
+              ;;
+            *)
+              DETAIL="$JOB completed successfully."
+              EMAIL_DETAIL="$JOB completed successfully."
+              ;;
+          esac
+        else
+          case "$JOB" in
+            sonarqube)
+              DETAIL="SonarQube Report\n Bugs: ${{ inputs.sonar_bugs }}\n Vulnerabilities: ${{ inputs.sonar_vulnerabilities }}\n Code Smells: ${{ inputs.sonar_code_smells }}\n Coverage: ${{ inputs.sonar_coverage }}%\n Quality Gate: ${{ inputs.sonar_gate_status }}"
+              EMAIL_DETAIL="SonarQube Report:\n Bugs: ${{ inputs.sonar_bugs }}\n Vulnerabilities: ${{ inputs.sonar_vulnerabilities }}\n Code Smells: ${{ inputs.sonar_code_smells }}\n Coverage: ${{ inputs.sonar_coverage }}%\n Quality Gate: ${{ inputs.sonar_gate_status }}"
+              ;;
+            snyk-sca)
+              DETAIL="Snyk Report\n Critical: ${{ inputs.snyk_critical }}\n High: ${{ inputs.snyk_high }}\n Medium: ${{ inputs.snyk_medium }}\n\n Error:\n ${{ inputs.error_message }}"
+              EMAIL_DETAIL="Snyk Report:\n Critical CVEs: ${{ inputs.snyk_critical }}\n High CVEs: ${{ inputs.snyk_high }}\n Medium CVEs: ${{ inputs.snyk_medium }}\n\nError:\n ${{ inputs.error_message }}"
+              ;;
+            docker)
+              DETAIL="Docker / GHCR Details\n Image: ${{ inputs.docker_image }}:${{ inputs.docker_tag }}\n Registry: GHCR (ghcr.io)\n\n Error:\n ${{ inputs.error_message }}"
+              EMAIL_DETAIL="Docker / GHCR Details:\n Image: ${{ inputs.docker_image }}:${{ inputs.docker_tag }}\n Registry: GHCR\n\nError:\n ${{ inputs.error_message }}"
+              ;;
+            trivy-scan)
+              DETAIL="Trivy Image Scan Report\n Image: ${{ inputs.docker_image }}:${{ inputs.docker_tag }}\n Critical CVEs: ${{ inputs.trivy_critical }}\n High CVEs: ${{ inputs.trivy_high }}\n\n WARNING GitOps update was blocked - image not safe."
+              EMAIL_DETAIL="Trivy Scan Report:\n Image: ${{ inputs.docker_image }}:${{ inputs.docker_tag }}\n Critical CVEs: ${{ inputs.trivy_critical }}\n High CVEs: ${{ inputs.trivy_high }}\n\nWARNING: GitOps update was blocked - image not deployed."
+              ;;
+            gitops)
+              DETAIL="GitOps Update Failed\n Could not update Helm values or push to Git.\n\n Error:\n ${{ inputs.error_message }}"
+              EMAIL_DETAIL="GitOps Update Failed:\n Could not update Helm values or push to Git.\n\nError:\n ${{ inputs.error_message }}"
+              ;;
+            *)
+              DETAIL="Error:\n ${{ inputs.error_message }}"
+              EMAIL_DETAIL="Error:\n ${{ inputs.error_message }}"
+              ;;
+          esac
+        fi
+
+        DETAIL_ENCODED="${DETAIL//$'\n'/\\n}"
+        echo "detail=$DETAIL_ENCODED" >> $GITHUB_OUTPUT
+
+        EMAIL_DETAIL_REAL="${EMAIL_DETAIL//\\n/$'\n'}"
+        echo "email_detail<<EOF_EMAIL_MARKER" >> $GITHUB_OUTPUT
+        echo "$EMAIL_DETAIL_REAL"             >> $GITHUB_OUTPUT
+        echo "EOF_EMAIL_MARKER"               >> $GITHUB_OUTPUT
+
+    - name: Send Slack notification
+      uses: slackapi/slack-github-action@v1.27.0
+      with:
+        payload: |
+          {
+            "text": "${{ steps.ctx.outputs.status_emoji }} PIPELINE ${{ steps.ctx.outputs.status_label }} - ${{ steps.ctx.outputs.job_label }}",
+            "attachments": [
+              {
+                "color": "${{ steps.ctx.outputs.color }}",
+                "blocks": [
+                  {
+                    "type": "header",
+                    "text": {
+                      "type": "plain_text",
+                      "text": "${{ steps.ctx.outputs.status_emoji }} PIPELINE ${{ steps.ctx.outputs.status_label }} - ${{ steps.ctx.outputs.job_label }}"
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "fields": [
+                      { "type": "mrkdwn", "text": "*Repository:*\n${{ github.repository }}" },
+                      { "type": "mrkdwn", "text": "*Branch:*\n${{ github.ref_name }}" },
+                      { "type": "mrkdwn", "text": "*Run:*\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|#${{ github.run_number }}>" }
+                    ]
+                  },
+                  { "type": "divider" },
+                  {
+                    "type": "section",
+                    "text": { "type": "mrkdwn", "text": "${{ steps.ctx.outputs.detail }}" }
+                  }
+                ]
+              }
+            ]
+          }
+      env:
+        SLACK_WEBHOOK_URL: ${{ inputs.slack_webhook_url }}
+        SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+    - name: Send Gmail notification
+      if: inputs.gmail_username != '' && inputs.notify_email_to != ''
+      uses: dawidd6/action-send-mail@v3
+      with:
+        server_address: smtp.gmail.com
+        server_port: 465
+        secure: true
+        username: ${{ inputs.gmail_username }}
+        password: ${{ inputs.gmail_app_password }}
+        to: ${{ inputs.notify_email_to }}
+        from: "GitHub Actions <${{ inputs.gmail_username }}>"
+        subject: >
+          ${{ steps.ctx.outputs.status_emoji }} [${{ inputs.pipeline }}]
+          ${{ steps.ctx.outputs.status_label }} - ${{ steps.ctx.outputs.job_label }}
+          (${{ github.repository }} @ ${{ github.ref_name }})
+        body: |
+          Pipeline ${{ steps.ctx.outputs.status_label }}: ${{ steps.ctx.outputs.job_label }}
+          
+          Repository : ${{ github.repository }}
+          Branch     : ${{ github.ref_name }}
+          Run        : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          
+          ${{ steps.ctx.outputs.email_detail }}
+

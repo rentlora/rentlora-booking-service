@@ -1,0 +1,315 @@
+﻿name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [develop]       # Auto-deploy to DEV on develop branch
+    tags: ['v*.*.*']          # Manual release to PROD when tag is created
+  pull_request:
+    branches: [develop, main] # Only run CI (Sonar/Snyk) on PRs
+
+permissions:
+  security-events: write
+  contents: write
+  packages: write
+
+env:
+  # --- Change these per service when copying ---------------------------------
+  SERVICE:           rentlora-booking-service
+  IMAGE_NAME:        ghcr.io/rentlora/rentlora-booking-service
+  SONAR_PROJECT_KEY: rentlora_booking-service
+  HELM_REPO:         rentlora/rentlora-helm
+  # ---------------------------------------------------------------------------
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # 1. SAST SCAN
+  # ---------------------------------------------------------------------------
+  sonarqube:
+    name: SonarQube
+    runs-on: ubuntu-latest
+    outputs:
+      quality_gate:    ${{ steps.gate.outputs.quality-gate-status }}
+      bugs:            ${{ steps.metrics.outputs.bugs }}
+      vulnerabilities: ${{ steps.metrics.outputs.vulnerabilities }}
+      code_smells:     ${{ steps.metrics.outputs.code_smells }}
+      coverage:        ${{ steps.metrics.outputs.coverage }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: SonarSource/sonarqube-scan-action@v7.1.0
+        env:
+          SONAR_TOKEN:    ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      - id: gate
+        uses: sonarsource/sonarqube-quality-gate-action@master
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN:    ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      - id: metrics
+        if: always()
+        run: |
+          M=$(curl -s -u "${{ secrets.SONAR_TOKEN }}:" "${{ secrets.SONAR_HOST_URL }}/api/measures/component?component=${{ env.SONAR_PROJECT_KEY }}&metricKeys=bugs,vulnerabilities,code_smells,coverage")
+          echo "bugs=$(echo $M|jq -r '.component.measures[]|select(.metric=="bugs")|.value')" >> $GITHUB_OUTPUT
+          echo "vulnerabilities=$(echo $M|jq -r '.component.measures[]|select(.metric=="vulnerabilities")|.value')" >> $GITHUB_OUTPUT
+          echo "code_smells=$(echo $M|jq -r '.component.measures[]|select(.metric=="code_smells")|.value')" >> $GITHUB_OUTPUT
+          echo "coverage=$(echo $M|jq -r '.component.measures[]|select(.metric=="coverage")|.value')" >> $GITHUB_OUTPUT
+
+      - if: steps.gate.outputs.quality-gate-status != 'PASSED'
+        run: exit 1
+
+      - if: failure()
+        uses: ./.github/actions/slack-notify
+        with:
+          status: "failed"
+          pipeline: "CI/CD"
+          job_name: "sonarqube"
+          service_name:        ${{ env.SERVICE }}
+          sonar_bugs:          ${{ steps.metrics.outputs.bugs }}
+          sonar_vulnerabilities: ${{ steps.metrics.outputs.vulnerabilities }}
+          sonar_code_smells:   ${{ steps.metrics.outputs.code_smells }}
+          sonar_coverage:      ${{ steps.metrics.outputs.coverage }}
+          sonar_gate_status:   ${{ steps.gate.outputs.quality-gate-status }}
+          slack_webhook_url:   ${{ secrets.SLACK_WEBHOOK_URL }}
+          gmail_username:      ${{ secrets.GMAIL_USERNAME }}
+          gmail_app_password:  ${{ secrets.GMAIL_APP_PASSWORD }}
+          notify_email_to:     ${{ secrets.NOTIFY_EMAIL_TO }}
+
+  # ---------------------------------------------------------------------------
+  # 2. SCA SCAN
+  # ---------------------------------------------------------------------------
+  snyk-sca:
+    name: Snyk SCA
+    needs: sonarqube
+    runs-on: ubuntu-latest
+    outputs:
+      critical:  ${{ steps.counts.outputs.critical }}
+      high:      ${{ steps.counts.outputs.high }}
+      medium:    ${{ steps.counts.outputs.medium }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: snyk
+        uses: snyk/actions/python@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --sarif-file-output=snyk.sarif --severity-threshold=high --json-file-output=snyk.json
+
+      - id: counts
+        if: always()
+        run: |
+          if [ -f snyk.json ]; then
+            echo "critical=$(jq '[.vulnerabilities[]|select(.severity=="critical")]|length' snyk.json||echo "0")" >> $GITHUB_OUTPUT
+            echo "high=$(jq '[.vulnerabilities[]|select(.severity=="high")]|length' snyk.json||echo "0")" >> $GITHUB_OUTPUT
+            echo "medium=$(jq '[.vulnerabilities[]|select(.severity=="medium")]|length' snyk.json||echo "0")" >> $GITHUB_OUTPUT
+          else
+            echo "critical=N/A"; echo "high=N/A"; echo "medium=N/A" >> $GITHUB_OUTPUT
+          fi
+
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: snyk.sarif
+          category:   snyk-${{ env.SERVICE }}
+
+      - if: steps.snyk.outcome == 'failure'
+        run: exit 1
+
+      - if: failure()
+        uses: ./.github/actions/slack-notify
+        with:
+          status: "failed"
+          pipeline: "CI/CD"
+          job_name: "snyk-sca"
+          service_name:       ${{ env.SERVICE }}
+          snyk_critical:      ${{ steps.counts.outputs.critical }}
+          snyk_high:          ${{ steps.counts.outputs.high }}
+          snyk_medium:        ${{ steps.counts.outputs.medium }}
+          slack_webhook_url:  ${{ secrets.SLACK_WEBHOOK_URL }}
+          gmail_username:     ${{ secrets.GMAIL_USERNAME }}
+          gmail_app_password:  ${{ secrets.GMAIL_APP_PASSWORD }}
+          notify_email_to:     ${{ secrets.NOTIFY_EMAIL_TO }}
+
+  # ---------------------------------------------------------------------------
+  # 3. DOCKER BUILD & PUSH (Skips PRs, only runs on Push)
+  # ---------------------------------------------------------------------------
+  docker:
+    name: Docker Build & Push
+    needs: snyk-sca
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.tag.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image tag (Manual Release vs Dev SHA)
+        id: tag
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            # Production Release (Triggered by manual tag)
+            TAG_NAME=${GITHUB_REF#refs/tags/}
+            echo "image_tag=$TAG_NAME" >> $GITHUB_OUTPUT
+          else
+            # Development Release (Triggered by develop branch)
+            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+            echo "image_tag=sha-${SHORT_SHA}" >> $GITHUB_OUTPUT
+          fi
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        with:
+          context:    .
+          push:       true
+          tags:       ${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.image_tag }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+      - if: failure()
+        uses: ./.github/actions/slack-notify
+        with:
+          status: "failed"
+          pipeline: "CI/CD"
+          job_name: "docker"
+          service_name:       ${{ env.SERVICE }}
+          docker_image:       ${{ env.IMAGE_NAME }}
+          docker_tag:         ${{ steps.tag.outputs.image_tag }}
+          slack_webhook_url:  ${{ secrets.SLACK_WEBHOOK_URL }}
+          gmail_username:     ${{ secrets.GMAIL_USERNAME }}
+          gmail_app_password:  ${{ secrets.GMAIL_APP_PASSWORD }}
+          notify_email_to:     ${{ secrets.NOTIFY_EMAIL_TO }}
+
+  # ---------------------------------------------------------------------------
+  # 4. TRIVY IMAGE SCAN
+  # ---------------------------------------------------------------------------
+  trivy-image:
+    name: Trivy Scan
+    needs: docker
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      critical: ${{ steps.counts.outputs.critical }}
+      high:     ${{ steps.counts.outputs.high }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ needs.docker.outputs.image_tag }}
+          severity:  CRITICAL,HIGH
+          exit-code: "1"
+          format:    sarif
+          output:    trivy.sarif
+
+      - id: counts
+        if: always()
+        run: |
+          echo "critical=$(cat trivy.sarif | jq '[.runs[].results[]|select(.level=="error")]|length' 2>/dev/null || echo 0)" >> $GITHUB_OUTPUT
+          echo "high=$(cat trivy.sarif | jq '[.runs[].results[]|select(.level=="warning")]|length' 2>/dev/null || echo 0)" >> $GITHUB_OUTPUT
+
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy.sarif
+          category:   trivy-${{ env.SERVICE }}
+
+      - if: failure()
+        uses: ./.github/actions/slack-notify
+        with:
+          status: "failed"
+          pipeline: "CI/CD"
+          job_name: "trivy-scan"
+          service_name:       ${{ env.SERVICE }}
+          docker_image:       ${{ env.IMAGE_NAME }}
+          docker_tag:         ${{ needs.docker.outputs.image_tag }}
+          slack_webhook_url:  ${{ secrets.SLACK_WEBHOOK_URL }}
+          gmail_username:     ${{ secrets.GMAIL_USERNAME }}
+          gmail_app_password:  ${{ secrets.GMAIL_APP_PASSWORD }}
+          notify_email_to:     ${{ secrets.NOTIFY_EMAIL_TO }}
+
+  # ---------------------------------------------------------------------------
+  # 5. GITOPS UPDATE (Updates DEV or PROD helm values)
+  # ---------------------------------------------------------------------------
+  gitops:
+    name: GitOps Update
+    needs: [docker, trivy-image]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.HELM_REPO }}
+          token:      ${{ secrets.GIT_TOKEN }}
+          path:       _helm
+
+      - uses: mikefarah/yq@v4
+
+      - run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            # Production Release 
+            FILE="${{ env.SERVICE }}/values-prod.yaml"
+            ENV_NAME="PROD"
+          else
+            # Development Release
+            FILE="${{ env.SERVICE }}/values-dev.yaml"
+            ENV_NAME="DEV"
+          fi
+          
+          yq e ".image.tag = \"${{ needs.docker.outputs.image_tag }}\"" -i _helm/$FILE
+          
+          cd _helm
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add $FILE
+          git diff --staged --quiet && exit 0
+          git commit -m "ci(${{ env.SERVICE }}): deploy ${{ needs.docker.outputs.image_tag }} to $ENV_NAME [skip ci]"
+          git push origin main
+
+  # ---------------------------------------------------------------------------
+  # 6. SUCCESS NOTIFICATION
+  # ---------------------------------------------------------------------------
+  notify-success:
+    name: Notify Success
+    needs: [sonarqube, snyk-sca, docker, trivy-image, gitops]
+    runs-on: ubuntu-latest
+    if: success() && github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/slack-notify
+        with:
+          status: "success"
+          pipeline: "CI/CD"
+          job_name: "all"
+          service_name:          ${{ env.SERVICE }}
+          docker_image:          ${{ env.IMAGE_NAME }}
+          docker_tag:            ${{ needs.docker.outputs.image_tag }}
+          sonar_bugs:            ${{ needs.sonarqube.outputs.bugs }}
+          sonar_vulnerabilities: ${{ needs.sonarqube.outputs.vulnerabilities }}
+          sonar_code_smells:     ${{ needs.sonarqube.outputs.code_smells }}
+          sonar_coverage:        ${{ needs.sonarqube.outputs.coverage }}
+          sonar_gate_status:     ${{ needs.sonarqube.outputs.quality_gate }}
+          snyk_critical:         ${{ needs.snyk-sca.outputs.critical }}
+          snyk_high:             ${{ needs.snyk-sca.outputs.high }}
+          snyk_medium:           ${{ needs.snyk-sca.outputs.medium }}
+          trivy_critical:        ${{ needs.trivy-image.outputs.critical }}
+          trivy_high:            ${{ needs.trivy-image.outputs.high }}
+          slack_webhook_url:     ${{ secrets.SLACK_WEBHOOK_URL }}
+          gmail_username:        ${{ secrets.GMAIL_USERNAME }}
+          gmail_app_password:    ${{ secrets.GMAIL_APP_PASSWORD }}
+          notify_email_to:       ${{ secrets.NOTIFY_EMAIL_TO }}
+
