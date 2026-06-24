@@ -1,0 +1,17 @@
+name: build
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  build:
+    uses: rentlora/.github/.github/workflows/build.yml@main
+    with:
+      service: booking-service
+    secrets: inherit

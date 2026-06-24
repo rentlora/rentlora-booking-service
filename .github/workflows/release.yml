@@ -1,0 +1,14 @@
+name: release
+on:
+  release:
+    types: [published]
+concurrency: production-release-booking-service
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  release:
+    uses: rentlora/.github/.github/workflows/release.yml@main
+    with:
+      service: booking-service
+    secrets: inherit

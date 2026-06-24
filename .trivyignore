@@ -1,0 +1,6 @@
+# Accepted Trivy findings (CVE IDs, one per line). The image scan blocks deploys on
+# CRITICAL; HIGH base-image/OS findings are reported to the Security tab and tracked
+# here as tech-debt. Add a CVE id (with a short reason) to suppress it from the gate.
+#
+# Example:
+#   CVE-2024-12345   # base image, no fix available yet, not reachable in our code

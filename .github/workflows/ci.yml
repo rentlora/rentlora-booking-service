@@ -1,0 +1,17 @@
+name: ci
+on:
+  pull_request:
+    branches: [main]
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+  pull-requests: write
+  security-events: write
+jobs:
+  ci:
+    uses: rentlora/.github/.github/workflows/ci-backend.yml@main
+    with:
+      service: booking-service
+    secrets: inherit
