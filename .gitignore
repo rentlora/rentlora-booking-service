@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.env
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+
+# Docker
+.dockerignore
+
+# IDE
+.vscode/
+.idea/
